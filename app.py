@@ -1,10 +1,9 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
+from streamlit_gsheets import GSheetsConnection
 from datetime import datetime, date, timedelta
 import os
 from io import StringIO
-import shutil
 
 # --- CONFIGURATION ---
 DB_NAME = 'vikrant_tracker_v2.db'
