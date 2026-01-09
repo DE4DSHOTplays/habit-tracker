@@ -1,14 +1,9 @@
 import streamlit as st
 import pandas as pd
-from streamlit_gsheets import GSheetsConnection
 from datetime import datetime, date, timedelta
-import os
-from io import StringIO
+from streamlit_gsheets import GSheetsConnection
 
 # --- CONFIGURATION ---
-DB_NAME = 'vikrant_tracker_v2.db'
-DB_BACKUP_DIR = 'backups'
-
 # Scoring configuration
 SCORE_CONFIG = {
     'coded_today': 30,
@@ -30,145 +25,91 @@ EMOJI_CONFIG = {
     'notes': '📝',
 }
 
-# --- BACKEND ---
-def init_db():
-    """Initialize database with schema, create backup directory."""
-    try:
-        os.makedirs(DB_BACKUP_DIR, exist_ok=True)
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS daily_log
-                     (log_date TEXT PRIMARY KEY, 
-                      pushups INTEGER,
-                      study_hours REAL, 
-                      water_liters REAL,
-                      coded_today INTEGER,
-                      no_junk_food INTEGER,
-                      workout_done INTEGER,
-                      notes TEXT,
-                      victory_score INTEGER)''')
-        
-        # Migration: Add missing columns if they don't exist
-        c.execute("PRAGMA table_info(daily_log)")
-        columns = [col[1] for col in c.fetchall()]
-        
-        # Remove took_supplements if it exists (migration from old schema)
-        if 'took_supplements' in columns:
-            c.execute('''
-                CREATE TABLE daily_log_new (
-                    log_date TEXT PRIMARY KEY,
-                    pushups INTEGER,
-                    study_hours REAL,
-                    water_liters REAL,
-                    coded_today INTEGER,
-                    no_junk_food INTEGER,
-                    workout_done INTEGER,
-                    notes TEXT,
-                    victory_score INTEGER
-                )
-            ''')
-            c.execute('''
-                INSERT INTO daily_log_new 
-                SELECT log_date, pushups, study_hours, water_liters, 
-                       coded_today, no_junk_food, workout_done, notes, victory_score 
-                FROM daily_log
-            ''')
-            c.execute('DROP TABLE daily_log')
-            c.execute('ALTER TABLE daily_log_new RENAME TO daily_log')
-        
-        # Add workout_done if it doesn't exist (migration from old schema)
-        if 'workout_done' not in columns:
-            c.execute("ALTER TABLE daily_log ADD COLUMN workout_done INTEGER DEFAULT 0")
-        
-        # Add notes if it doesn't exist
-        if 'notes' not in columns:
-            c.execute("ALTER TABLE daily_log ADD COLUMN notes TEXT DEFAULT ''")
-        
-        conn.commit()
-        conn.close()
-        auto_backup_db()
-    except Exception as e:
-        st.error(f"Database initialization error: {e}")
-
-def auto_backup_db():
-    """Auto-backup database every time the app runs."""
-    try:
-        if os.path.exists(DB_NAME):
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_file = os.path.join(DB_BACKUP_DIR, f"backup_{timestamp}.db")
-            shutil.copy(DB_NAME, backup_file)
-            # Keep only last 10 backups
-            backups = sorted(os.listdir(DB_BACKUP_DIR))
-            if len(backups) > 10:
-                for old_backup in backups[:-10]:
-                    os.remove(os.path.join(DB_BACKUP_DIR, old_backup))
-    except Exception as e:
-        st.warning(f"Backup error: {e}")
+# --- BACKEND FUNCTIONS ---
 
 def get_current_week_dates(offset_weeks=0):
     """Returns a list of dates for a week (Sunday to Saturday), with optional week offset."""
     today = date.today()
-    today = today - timedelta(weeks=offset_weeks)
-    days_to_subtract = (today.weekday() + 1) % 7
-    start_sunday = today - timedelta(days=days_to_subtract)
+    # Adjust to the target week
+    target_date = today - timedelta(weeks=-offset_weeks)  # Fixed sign for intuitive navigation
+    
+    # Find the Sunday of that week
+    # weekday(): Mon=0, Sun=6. If today is Sun(6), we subtract 6 days? No, standard is usually Sun=0.
+    # Python date.weekday() returns Mon=0, Sun=6.
+    # To make Sunday the start: 
+    days_to_subtract = (target_date.weekday() + 1) % 7
+    start_sunday = target_date - timedelta(days=days_to_subtract)
     
     week_dates = []
     for i in range(7):
         week_dates.append(start_sunday + timedelta(days=i))
     return week_dates, start_sunday
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def get_display_data(offset_weeks=0):
-    """Get data for the specified week with caching."""
-    conn = sqlite3.connect(DB_NAME)
+    """Get data for the specified week from Google Sheets with caching."""
+    # 1. Connect to Google Sheets
+    conn = st.connection("gsheets", type=GSheetsConnection)
     
-    # 1. Get standard week dates (Sun -> Sat)
-    week_dates, start_sunday = get_current_week_dates(offset_weeks)
-    # Convert to strings for merging
-    str_dates = [d.isoformat() for d in week_dates]
-    
+    # 2. Read data (handle empty sheet case)
     try:
-        df_db = pd.read_sql_query("SELECT * FROM daily_log", conn)
+        df_db = conn.read(worksheet="Sheet1")
     except:
         df_db = pd.DataFrame()
-    conn.close()
 
-    # 2. Create Master DataFrame
+    # 3. Get standard week dates (Sun -> Sat)
+    week_dates, start_sunday = get_current_week_dates(offset_weeks)
+    str_dates = [d.isoformat() for d in week_dates]
+    
+    # 4. Create Master DataFrame for the requested week
     df_week = pd.DataFrame({'log_date': str_dates})
     
     if not df_db.empty:
+        # Ensure log_date is string for merging
+        df_db['log_date'] = df_db['log_date'].astype(str)
+        # Merge DB data into the week structure
         df_final = pd.merge(df_week, df_db, on='log_date', how='left')
     else:
         df_final = df_week
 
-    # 3. Defaults for missing data
+    # 5. Defaults for missing data
     required_cols = {
-        'coded_today': False, 'no_junk_food': False, 'workout_done': False,
-        'pushups': 0, 'study_hours': 0.0, 'water_liters': 0.0, 'victory_score': 0, 'notes': ''
+        'coded_today': False, 
+        'no_junk_food': False, 
+        'workout_done': False,
+        'pushups': 0, 
+        'study_hours': 0.0, 
+        'water_liters': 0.0, 
+        'victory_score': 0, 
+        'notes': ''
     }
+    
     for col, default_val in required_cols.items():
         if col not in df_final.columns:
             df_final[col] = default_val
 
-    df_final.fillna(0, inplace=True)
+    # Fill NaNs with defaults (important for new days)
+    # We must handle types carefully. 
+    df_final['pushups'] = df_final['pushups'].fillna(0)
+    df_final['study_hours'] = df_final['study_hours'].fillna(0.0)
+    df_final['water_liters'] = df_final['water_liters'].fillna(0.0)
+    df_final['victory_score'] = df_final['victory_score'].fillna(0)
+    df_final['notes'] = df_final['notes'].fillna("")
     
-    # 4. Fix Boolean Types
+    # 6. Fix Boolean Types (Streamlit needs actual bools for checkboxes)
     bool_cols = ['coded_today', 'no_junk_food', 'workout_done']
     for col in bool_cols:
-        df_final[col] = df_final[col].astype(bool)
+        df_final[col] = df_final[col].fillna(False).astype(bool)
 
-    # 5. FORMATTING FOR DISPLAY
-    # We add a 'Day' column formatted as "09 JAN FRI"
-    # We keep 'log_date' hidden to identify the row accurately
+    # 7. FORMATTING FOR DISPLAY
+    # Add 'Day' column like "09 JAN FRI"
     df_final['Day'] = df_final['log_date'].apply(
         lambda x: datetime.strptime(x, "%Y-%m-%d").strftime("%d %b %a").upper()
     )
     
-    # Move 'Day' to the front
+    # Move 'Day' to the front, keep 'log_date' for logic
     cols = ['Day', 'log_date'] + [c for c in df_final.columns if c not in ['Day', 'log_date']]
-    df_final = df_final[cols]
-    
-    return df_final, start_sunday
+    return df_final[cols], start_sunday
 
 def validate_numeric_input(value, min_val=0, max_val=None):
     """Validate numeric input to prevent invalid data."""
@@ -183,91 +124,60 @@ def validate_numeric_input(value, min_val=0, max_val=None):
         return min_val
 
 def save_grid_changes(edited_df):
-    """Save grid changes with validation and error handling."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    today_str = date.today().isoformat()
-    
-    ignored_future = False
-    saved_count = 0
-
-    for index, row in edited_df.iterrows():
+    """Save grid changes to Google Sheets."""
+    try:
+        conn = st.connection("gsheets", type=GSheetsConnection)
+        
+        # 1. Read existing full history to avoid overwriting other weeks
         try:
-            # --- FUTURE DATE PROTECTION ---
-            if row['log_date'] > today_str:
-                ignored_future = True
-                continue 
+            full_history_df = conn.read(worksheet="Sheet1")
+            full_history_df['log_date'] = full_history_df['log_date'].astype(str)
+        except:
+            full_history_df = pd.DataFrame()
 
-            # --- INPUT VALIDATION ---
-            pushups = validate_numeric_input(row['pushups'], 0, 200)
-            study_hours = validate_numeric_input(row['study_hours'], 0, 24)
-            water_liters = validate_numeric_input(row['water_liters'], 0, 20)
+        # 2. Clean the edited data
+        save_df = edited_df.copy()
+        
+        # Remove the display column 'Day'
+        if 'Day' in save_df.columns:
+            save_df = save_df.drop(columns=['Day'])
+            
+        # Recalculate scores for the edited rows
+        for index, row in save_df.iterrows():
+            # Future Date Check (Optional: You can uncomment to lock future dates)
+            # if row['log_date'] > date.today().isoformat(): continue
 
-            # --- SCORING ---
             score = 0
             if row['coded_today']: score += SCORE_CONFIG['coded_today']
             if row['no_junk_food']: score += SCORE_CONFIG['no_junk_food']
             if row['workout_done']: score += SCORE_CONFIG['workout_done']
-            score += min(pushups * 1, SCORE_CONFIG['pushups_max'])
-            score += min(study_hours * 5, SCORE_CONFIG['study_hours_max'])
-            final_score = min(score, 100)
-            
-            c.execute('''INSERT OR REPLACE INTO daily_log 
-                         (log_date, pushups, study_hours, water_liters, coded_today, no_junk_food, workout_done, notes, victory_score)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                      (row['log_date'], int(pushups), study_hours, water_liters, 
-                       int(row['coded_today']), int(row['no_junk_food']), int(row['workout_done']), 
-                       str(row.get('notes', '')), final_score))
-            saved_count += 1
-        except Exception as e:
-            st.error(f"Error saving row {index}: {e}")
-    
-    try:
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        st.error(f"Database commit error: {e}")
-        return False
-    
-    if ignored_future:
-        st.toast("⚠️ Future dates were ignored (Locked).", icon="🔒")
-    st.success(f"✅ {saved_count} entries updated!")
-    return True
+            score += min(row['pushups'] * 1, SCORE_CONFIG['pushups_max'])
+            score += min(row['study_hours'] * 5, SCORE_CONFIG['study_hours_max'])
+            save_df.at[index, 'victory_score'] = min(score, 100)
 
-def get_streak_data(habit_col):
-    """Calculate current and longest streak for a habit."""
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        df_all = pd.read_sql_query("SELECT log_date, {} FROM daily_log ORDER BY log_date".format(habit_col), conn)
-        conn.close()
+        # 3. Merge Strategy
+        if not full_history_df.empty:
+            # Get the list of dates we are currently updating
+            dates_being_updated = save_df['log_date'].tolist()
+            
+            # Keep all history rows that are NOT in the list of dates we are updating
+            history_kept = full_history_df[~full_history_df['log_date'].isin(dates_being_updated)]
+            
+            # Combine kept history with the new updates
+            final_df = pd.concat([history_kept, save_df], ignore_index=True)
+        else:
+            final_df = save_df
+
+        # 4. Sort and Save
+        final_df = final_df.sort_values('log_date')
+        conn.update(worksheet="Sheet1", data=final_df)
         
-        if df_all.empty:
-            return 0, 0
+        st.success("✅ Synced with Google Sheets!")
+        return True
         
-        df_all['log_date'] = pd.to_datetime(df_all['log_date'])
-        df_all[habit_col] = df_all[habit_col].astype(bool)
-        
-        # Calculate streaks
-        current_streak = 0
-        longest_streak = 0
-        temp_streak = 0
-        
-        for idx, row in df_all.iterrows():
-            if row[habit_col]:
-                temp_streak += 1
-                longest_streak = max(longest_streak, temp_streak)
-            else:
-                temp_streak = 0
-        
-        # Check if current streak is active (today or recent)
-        last_date = df_all['log_date'].iloc[-1]
-        if (date.today() - last_date.date()).days <= 1:
-            current_streak = temp_streak
-        
-        return current_streak, longest_streak
     except Exception as e:
-        st.error(f"Streak calculation error: {e}")
-        return 0, 0
+        st.error(f"Google Sheets Sync Error: {e}")
+        return False
 
 def get_completion_stats(df):
     """Calculate completion statistics for the week."""
@@ -285,14 +195,12 @@ def get_completion_stats(df):
         }
         return stats
     except Exception as e:
-        st.error(f"Stats calculation error: {e}")
         return {}
 
-def export_to_csv(df, filename="habit_tracker.csv"):
+def export_to_csv(df):
     """Generate CSV export data."""
     try:
-        csv = df.to_csv(index=False)
-        return csv
+        return df.to_csv(index=False).encode('utf-8')
     except Exception as e:
         st.error(f"Export error: {e}")
         return None
@@ -303,142 +211,18 @@ st.set_page_config(page_title="Vikrant's Supreme Tracker", page_icon="💪", lay
 # --- SOLO LEVELING THEME CSS ---
 st.markdown("""
 <style>
-    /* Main Background */
-    .main {
-        background: linear-gradient(135deg, #0a0e27 0%, #1a1a3e 100%);
-    }
-    
-    [data-testid="stAppViewContainer"] {
-        background: linear-gradient(135deg, #0a0e27 0%, #1a1a3e 100%);
-    }
-    
-    /* Sidebar */
-    [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #0f1028 0%, #1a1a3e 100%);
-        border-right: 2px solid #7c3aed;
-    }
-    
-    /* Text Colors */
-    h1, h2, h3, h4, h5, h6 {
-        color: #e0e0ff;
-        text-shadow: 0 0 20px rgba(124, 58, 237, 0.5);
-        font-family: 'Arial', sans-serif;
-        font-weight: 700;
-    }
-    
-    p, label, span {
-        color: #c0c0ff;
-    }
-    
-    /* Metric Cards */
-    [data-testid="metric-container"] {
-        background: linear-gradient(135deg, #1a0033 0%, #2d0052 100%);
-        border: 1px solid #7c3aed;
-        border-radius: 12px;
-        padding: 20px;
-        box-shadow: 0 0 20px rgba(124, 58, 237, 0.3), inset 0 0 20px rgba(124, 58, 237, 0.1);
-    }
-    
-    /* Buttons */
-    button {
-        background: linear-gradient(135deg, #7c3aed 0%, #a855f7 100%) !important;
-        color: #ffffff !important;
-        border: 1px solid #d8b4fe !important;
-        border-radius: 8px !important;
-        font-weight: 600 !important;
-        box-shadow: 0 0 15px rgba(168, 85, 247, 0.4) !important;
-        text-shadow: 0 0 10px rgba(0, 0, 0, 0.5) !important;
-    }
-    
-    button:hover {
-        background: linear-gradient(135deg, #a855f7 0%, #d946ef 100%) !important;
-        box-shadow: 0 0 25px rgba(168, 85, 247, 0.6) !important;
-    }
-    
-    /* Input Fields */
-    input, textarea, select {
-        background: #1a0033 !important;
-        color: #e0e0ff !important;
-        border: 1px solid #7c3aed !important;
-        border-radius: 6px !important;
-        box-shadow: 0 0 10px rgba(124, 58, 237, 0.2) !important;
-    }
-    
-    input:focus {
-        border-color: #d946ef !important;
-        box-shadow: 0 0 20px rgba(217, 70, 239, 0.5) !important;
-    }
-    
-    /* Data Editor */
-    [data-testid="dataframe"] {
-        background: #0f1028 !important;
-        border: 1px solid #7c3aed !important;
-        border-radius: 8px !important;
-        box-shadow: 0 0 20px rgba(124, 58, 237, 0.2) !important;
-    }
-    
-    /* Tabs */
-    [data-testid="stTabs"] [role="tablist"] {
-        border-bottom: 2px solid #7c3aed;
-    }
-    
-    [data-testid="stTabs"] [aria-selected="true"] {
-        background: linear-gradient(135deg, #7c3aed 0%, #a855f7 100%);
-        color: #ffffff;
-        border-radius: 6px 6px 0 0;
-    }
-    
-    /* Divider */
-    hr {
-        border: none;
-        border-top: 2px solid #7c3aed;
-        margin: 30px 0;
-        box-shadow: 0 0 20px rgba(124, 58, 237, 0.3);
-    }
-    
-    /* Toast/Success Messages */
-    .stAlert {
-        background: linear-gradient(135deg, #1a3a1a 0%, #2d5a2d 100%) !important;
-        border: 1px solid #4ade80 !important;
-        border-radius: 8px !important;
-        box-shadow: 0 0 20px rgba(74, 222, 128, 0.3) !important;
-    }
-    
-    .stAlert[kind="error"] {
-        background: linear-gradient(135deg, #3a1a1a 0%, #5a2d2d 100%) !important;
-        border: 1px solid #ef4444 !important;
-        box-shadow: 0 0 20px rgba(239, 68, 68, 0.3) !important;
-    }
-    
-    .stAlert[kind="warning"] {
-        background: linear-gradient(135deg, #3a2a1a 0%, #5a4a2d 100%) !important;
-        border: 1px solid #f97316 !important;
-        box-shadow: 0 0 20px rgba(249, 115, 22, 0.3) !important;
-    }
-    
-    /* Checkbox */
-    [type="checkbox"] {
-        accent-color: #a855f7 !important;
-    }
-    
-    /* Chart Container */
-    .stChart {
-        border: 1px solid #7c3aed;
-        border-radius: 8px;
-        padding: 15px;
-        background: rgba(26, 0, 51, 0.5);
-        box-shadow: 0 0 15px rgba(124, 58, 237, 0.2);
-    }
-    
-    /* Session State */
-    .stDownloadButton > button {
-        background: linear-gradient(135deg, #f59e0b 0%, #fbbf24 100%) !important;
-        color: #000 !important;
-    }
+    .main { background: linear-gradient(135deg, #0a0e27 0%, #1a1a3e 100%); }
+    [data-testid="stAppViewContainer"] { background: linear-gradient(135deg, #0a0e27 0%, #1a1a3e 100%); }
+    [data-testid="stSidebar"] { background: linear-gradient(180deg, #0f1028 0%, #1a1a3e 100%); border-right: 2px solid #7c3aed; }
+    h1, h2, h3, h4, h5, h6 { color: #e0e0ff; text-shadow: 0 0 20px rgba(124, 58, 237, 0.5); font-family: 'Arial', sans-serif; font-weight: 700; }
+    p, label, span { color: #c0c0ff; }
+    [data-testid="metric-container"] { background: linear-gradient(135deg, #1a0033 0%, #2d0052 100%); border: 1px solid #7c3aed; border-radius: 12px; padding: 20px; box-shadow: 0 0 20px rgba(124, 58, 237, 0.3); }
+    button { background: linear-gradient(135deg, #7c3aed 0%, #a855f7 100%) !important; color: #ffffff !important; border: 1px solid #d8b4fe !important; border-radius: 8px !important; }
+    input, textarea, select { background: #1a0033 !important; color: #e0e0ff !important; border: 1px solid #7c3aed !important; }
+    [data-testid="dataframe"] { background: #0f1028 !important; border: 1px solid #7c3aed !important; }
+    hr { border-top: 2px solid #7c3aed; }
 </style>
 """, unsafe_allow_html=True)
-
-init_db()
 
 st.title("📅 Weekly Habit Sheet")
 
@@ -456,46 +240,44 @@ st.markdown("""
 
 # --- SIDEBAR: WEEK NAVIGATION & CONTROLS ---
 with st.sidebar:
-    st.markdown("""
-    <div style='text-align: center; padding: 20px 0;'>
-        <h3 style='color: #d946ef; text-shadow: 0 0 20px rgba(217, 70, 239, 0.6);'>⚔️ MISSION CONTROL</h3>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown("<h3 style='color: #d946ef;'>⚔️ MISSION CONTROL</h3>", unsafe_allow_html=True)
     
+    # Initialize session state for week offset
+    if 'week_offset' not in st.session_state:
+        st.session_state.week_offset = 0
+
     st.subheader("🗓️ Navigate Weeks")
     col1, col2 = st.columns(2)
     with col1:
         if st.button("← Previous", use_container_width=True):
-            st.session_state.week_offset = st.session_state.get('week_offset', 0) + 1
+            st.session_state.week_offset -= 1
+            st.cache_data.clear() # Clear cache to fetch new week data
+            st.rerun()
+            
     with col2:
         if st.button("Current →", use_container_width=True):
             st.session_state.week_offset = 0
-    
-    week_offset = st.session_state.get('week_offset', 0)
-    
-    st.divider()
-    st.markdown("<h4 style='color: #a855f7;'>📊 Dashboard Options</h4>", unsafe_allow_html=True)
-    show_history = st.checkbox("📈 Monthly View", value=False)
-    show_streaks = st.checkbox("🔥 Streak Tracker", value=True)
+            st.cache_data.clear()
+            st.rerun()
+            
+    # Next week button (Future)
+    if st.button("Next →", use_container_width=True):
+        st.session_state.week_offset += 1
+        st.cache_data.clear()
+        st.rerun()
+
+    week_offset = st.session_state.week_offset
 
 # 1. Load Data
 df, week_start = get_display_data(week_offset)
 week_label = week_start.strftime("%d %b %Y")
 
-st.markdown(f"""
-<div style='background: linear-gradient(135deg, #2d0052 0%, #1a0033 100%); 
-            border: 2px solid #7c3aed; border-radius: 10px; padding: 20px; 
-            margin-bottom: 20px; box-shadow: 0 0 20px rgba(124, 58, 237, 0.3);'>
-    <h3 style='color: #d946ef; margin: 0; text-shadow: 0 0 15px rgba(217, 70, 239, 0.6);'>
-        📅 Week of {week_label}
-    </h3>
-</div>
-""", unsafe_allow_html=True)
+st.markdown(f"### 📅 Week of {week_label}")
 
 # 2. Grid Config
 column_config = {
     "Day": st.column_config.TextColumn("Day", disabled=True),
-    "log_date": None,
+    "log_date": None, # Hidden
     "coded_today": st.column_config.CheckboxColumn(f"{EMOJI_CONFIG['coded_today']} Coded?", default=False),
     "no_junk_food": st.column_config.CheckboxColumn(f"{EMOJI_CONFIG['no_junk_food']} No Junk", default=False),
     "workout_done": st.column_config.CheckboxColumn(f"{EMOJI_CONFIG['workout_done']} Workout", default=False),
@@ -507,7 +289,6 @@ column_config = {
 }
 
 with st.form("weekly_form"):
-    # We display the grid
     edited_df = st.data_editor(
         df, 
         column_config=column_config, 
@@ -522,10 +303,11 @@ with st.form("weekly_form"):
     with col2:
         export_clicked = st.form_submit_button("📥 Export CSV", use_container_width=True)
     with col3:
-        reset_clicked = st.form_submit_button("🔄 Reset Week", use_container_width=True)
+        reset_clicked = st.form_submit_button("🔄 Refresh", use_container_width=True)
     
-     if save_clicked:
-        # We removed the extra checkbox. The "Save Changes" button IS the confirmation.
+    # --- SAVE LOGIC (FIXED) ---
+    if save_clicked:
+        # No extra checkbox here!
         if save_grid_changes(edited_df):
             st.session_state.week_offset = 0
             st.cache_data.clear()
@@ -535,24 +317,19 @@ with st.form("weekly_form"):
         csv_data = export_to_csv(edited_df)
         if csv_data:
             st.download_button(
-                label="Download CSV",
+                label="Click to Download CSV",
                 data=csv_data,
                 file_name=f"habit_tracker_{week_start.isoformat()}.csv",
                 mime="text/csv"
             )
     
     if reset_clicked:
-        if st.checkbox("Confirm reset? This cannot be undone."):
-            # Would need to implement reset logic
-            st.toast("Reset not implemented yet", icon="⚠️")
+        st.cache_data.clear()
+        st.rerun()
 
 # --- WEEKLY STATISTICS ---
 st.divider()
-st.markdown("""
-<div style='text-align: center; margin: 20px 0;'>
-    <h2 style='color: #d946ef; text-shadow: 0 0 20px rgba(217, 70, 239, 0.6);'>📊 WEEKLY PERFORMANCE</h2>
-</div>
-""", unsafe_allow_html=True)
+st.markdown("<h2 style='text-align: center; color: #d946ef;'>📊 WEEKLY PERFORMANCE</h2>", unsafe_allow_html=True)
 
 if not edited_df.empty:
     stats = get_completion_stats(edited_df)
@@ -567,101 +344,3 @@ if not edited_df.empty:
     with col4:
         completion_rate = round((stats.get('completed_days', 0) / 7) * 100)
         st.metric("Completion", f"{completion_rate}%", delta=None)
-    
-    st.divider()
-    
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("💻 Coded Days", stats.get('coded_days', 0))
-    with col2:
-        st.metric("🥗 Clean Days", stats.get('clean_days', 0))
-    with col3:
-        st.metric("🏋️ Workout Days", stats.get('workout_days', 0))
-    with col4:
-        st.metric("💪 Total Pushups", stats.get('total_pushups', 0))
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("📚 Study Hours", f"{stats.get('total_study', 0)}")
-    with col2:
-        st.metric("💧 Water Liters", f"{stats.get('total_water', 0)}")
-
-# --- STREAK INFORMATION ---
-if show_streaks:
-    st.divider()
-    st.markdown("""
-    <div style='text-align: center; margin: 20px 0;'>
-        <h2 style='color: #f59e0b; text-shadow: 0 0 20px rgba(245, 158, 11, 0.6);'>🔥 CURRENT STREAKS</h2>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    streak_cols = st.columns(3)
-    
-    with streak_cols[0]:
-        current, longest = get_streak_data('coded_today')
-        st.metric("💻 Coding Streak", f"{current} days", f"Best: {longest}")
-    
-    with streak_cols[1]:
-        current, longest = get_streak_data('no_junk_food')
-        st.metric("🥗 Clean Eating", f"{current} days", f"Best: {longest}")
-    
-    with streak_cols[2]:
-        current, longest = get_streak_data('workout_done')
-        st.metric("🏋️ Workout Streak", f"{current} days", f"Best: {longest}")
-
-# --- MONTHLY VIEW ---
-if show_history:
-    st.divider()
-    st.markdown("""
-    <div style='text-align: center; margin: 20px 0;'>
-        <h2 style='color: #d946ef; text-shadow: 0 0 20px rgba(217, 70, 239, 0.6);'>📈 JOURNEY PROGRESS</h2>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        df_all = pd.read_sql_query(
-            "SELECT log_date, victory_score FROM daily_log WHERE log_date >= date('now', '-30 days') ORDER BY log_date",
-            conn
-        )
-        conn.close()
-        
-        if not df_all.empty:
-            df_all['log_date'] = pd.to_datetime(df_all['log_date'])
-            df_all.set_index('log_date', inplace=True)
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.line_chart(df_all['victory_score'], height=300, color="#4CAF50")
-            with col2:
-                st.bar_chart(df_all['victory_score'], height=300, color="#FF5252")
-        else:
-            st.info("No historical data available yet. Keep tracking!")
-    except Exception as e:
-        st.error(f"Error loading history: {e}")
-
-# --- EXECUTION SCORE GRAPH ---
-st.divider()
-st.markdown("""
-<div style='text-align: center; margin: 20px 0;'>
-    <h2 style='color: #d946ef; text-shadow: 0 0 20px rgba(217, 70, 239, 0.6);'>⚡ POWER LEVEL CHART</h2>
-</div>
-""", unsafe_allow_html=True)
-
-if not edited_df.empty:
-    try:
-        plot_data = edited_df.copy()
-        
-        # Calculate visual completion status
-        plot_data['Status'] = plot_data['victory_score'].apply(
-            lambda x: "✅ Complete" if x == 100 else ("⚠️ Partial" if x > 0 else "❌ Empty")
-        )
-        
-        plot_data['Score Achieved'] = plot_data['victory_score']
-        plot_data['Score Missed'] = 100 - plot_data['victory_score']
-        
-        chart_data = plot_data.set_index('Day')[['Score Achieved', 'Score Missed']]
-        
-        st.line_chart(chart_data, color=["#4CAF50", "#FF5252"], height=300)
-    except Exception as e:
-        st.error(f"Error rendering chart: {e}")
