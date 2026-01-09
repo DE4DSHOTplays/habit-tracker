@@ -525,13 +525,12 @@ with st.form("weekly_form"):
     with col3:
         reset_clicked = st.form_submit_button("🔄 Reset Week", use_container_width=True)
     
-    if save_clicked:
-        # Confirmation before saving
-        if st.checkbox("Confirm save?"):
-            if save_grid_changes(edited_df):
-                st.session_state.week_offset = 0
-                st.cache_data.clear()
-                st.rerun()
+     if save_clicked:
+        # We removed the extra checkbox. The "Save Changes" button IS the confirmation.
+        if save_grid_changes(edited_df):
+            st.session_state.week_offset = 0
+            st.cache_data.clear()
+            st.rerun()
     
     if export_clicked:
         csv_data = export_to_csv(edited_df)
